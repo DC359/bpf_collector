@@ -1,0 +1,8 @@
+bpf/schedstat_snap
+bpf/schedstat_snap.bpf.o
+bpf/schedstat_snap.skel.h
+bpf/.bpftool-src/
+bpf/.libbpf-install/
+*.o
+.DS_Store
+bpf/vmlinux.h

@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""AHV host BPF collector: dump X/Y/Z Demand/Supply each interval until stopped."""
+
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+SLICE_PATHS = [
+    "/sys/fs/cgroup/ahv.slice/ahv-cvm.slice",
+    "/sys/fs/cgroup/ahv.slice/ahv-uvms.slice",
+    "/sys/fs/cgroup/system.slice",
+]
+SERVICE_PARENT = "/sys/fs/cgroup/system.slice"
+SCHEDSTATS = "/proc/sys/kernel/sched_schedstats"
+INSTALL_DIR = "/root/bpfsnap"
+INSTALL_BIN = INSTALL_DIR + "/schedstat_snap"
+RAW_PATH = "/tmp/bpfsnap_raw.txt"
+PID_PATH = "/tmp/bpfsnap.pid"
+STDERR_PATH = "/tmp/bpfsnap_stderr.txt"
+
+
+def build_metrics(X, Y, N, num_cpus, interval):
+    INTERVAL_NS = interval * 1000000000
+    CPU_BUDGET_NS = interval * num_cpus * 1000000000
+    T_ns = interval * N * 1000000000
+    Z = T_ns - X - Y if T_ns > (X + Y) else 0
+    Supply = X
+    if (X + Z) > 0:
+        ratio_scaled = (X * 1000000) // (X + Z)
+        fractional = (Y // 1000000) * ratio_scaled
+        if fractional < 0:
+            fractional = 0
+        Demand = X + fractional
+    else:
+        Demand = X
+    x_cores = round(X * 1.0 / INTERVAL_NS, 2) if INTERVAL_NS > 0 else 0.0
+    y_cores = round(Y * 1.0 / INTERVAL_NS, 2) if INTERVAL_NS > 0 else 0.0
+    return {
+        "X": X, "Y": Y, "Z": Z,
+        "Demand": Demand, "Supply": Supply,
+        "x_cores": x_cores, "y_cores": y_cores,
+        "xy_cores": round(x_cores + y_cores, 2),
+        "tasks": N,
+    }
+
+
+def parse_ticks(content):
+    ticks = []
+    cur = None
+    for line in content.splitlines():
+        parts = line.strip().split()
+        if not parts:
+            continue
+        if parts[0] == "TICK" and len(parts) >= 5:
+            mono_ns = 0
+            for p in parts[5:]:
+                if p.startswith("MONO=") and p.endswith("ns"):
+                    try:
+                        mono_ns = int(p[5:-2])
+                    except ValueError:
+                        pass
+            try:
+                cur = {
+                    "tick": int(parts[1]),
+                    "ts_start": parts[2],
+                    "ts_end": parts[3],
+                    "interval_s": int(parts[4]),
+                    "mono_ns": mono_ns,
+                    "slices": {},
+                    "services": {},
+                }
+            except ValueError:
+                cur = None
+        elif parts[0] == "END_TICK":
+            if cur is not None:
+                ticks.append(cur)
+            cur = None
+        elif cur is not None and parts[0] in ("SLICE", "SERVICE") and len(parts) >= 5:
+            try:
+                run, wait, count = int(parts[2]), int(parts[3]), int(parts[4])
+            except ValueError:
+                continue
+            key = "slices" if parts[0] == "SLICE" else "services"
+            cur[key][parts[1]] = (run, wait, count)
+    return ticks
+
+
+def enrich(tick, num_cpus):
+    interval = tick["interval_s"]
+    out = {
+        "tick": tick["tick"],
+        "ts_start": tick["ts_start"],
+        "ts_end": tick["ts_end"],
+        "interval_s": interval,
+        "mono_ns": tick.get("mono_ns", 0),
+        "slices": {},
+        "services": {},
+    }
+    for name, (run, wait, count) in tick["slices"].items():
+        out["slices"][name] = build_metrics(run, wait, count, num_cpus, interval)
+    for name, (run, wait, count) in tick["services"].items():
+        out["services"][name] = build_metrics(run, wait, count, num_cpus, interval)
+    return out
+
+
+def format_raw(tick):
+    lines = [
+        "TICK %d %s %s %d MONO=%dns" % (
+            tick["tick"], tick["ts_start"], tick["ts_end"],
+            tick["interval_s"], tick["mono_ns"]),
+    ]
+    for name, m in tick["slices"].items():
+        lines.append(
+            "SLICE %s X=%d Y=%d Z=%d Demand=%d Supply=%d x_cores=%.2f y_cores=%.2f tasks=%d"
+            % (name, m["X"], m["Y"], m["Z"], m["Demand"], m["Supply"],
+               m["x_cores"], m["y_cores"], m["tasks"]))
+    for name, m in tick["services"].items():
+        lines.append(
+            "SERVICE %s X=%d Y=%d Z=%d Demand=%d Supply=%d x_cores=%.2f y_cores=%.2f tasks=%d"
+            % (name, m["X"], m["Y"], m["Z"], m["Demand"], m["Supply"],
+               m["x_cores"], m["y_cores"], m["tasks"]))
+    lines.append("END_TICK")
+    return "\n".join(lines) + "\n"
+
+
+def format_json(tick):
+    return json.dumps(tick, separators=(",", ":")) + "\n"
+
+
+def find_prebuilt(script_dir):
+    candidates = [
+        os.path.join(script_dir, "..", "bpf", "prebuilt", "schedstat_snap"),
+        os.path.join(script_dir, "schedstat_snap"),
+        os.environ.get("BPF_BIN", ""),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return os.path.abspath(c)
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="AHV BPF CPU collector (no orchestration)")
+    ap.add_argument("-i", "--interval", type=int, default=5)
+    ap.add_argument("-f", "--format", choices=("raw", "json"), default="raw")
+    ap.add_argument("-o", "--outdir", default="/tmp")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0:
+        print("ERROR: must run as root on the AHV host", file=sys.stderr)
+        sys.exit(1)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    src_bin = find_prebuilt(script_dir)
+    if not src_bin:
+        print("ERROR: prebuilt schedstat_snap not found (bpf/prebuilt/schedstat_snap)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not os.path.isfile("/sys/kernel/btf/vmlinux"):
+        print("ERROR: /sys/kernel/btf/vmlinux missing — host cannot load BPF", file=sys.stderr)
+        sys.exit(1)
+
+    for p in SLICE_PATHS:
+        if not os.path.isdir(p):
+            print("ERROR: missing cgroup path %s" % p, file=sys.stderr)
+            sys.exit(1)
+
+    num_cpus = os.cpu_count() or 1
+    sched_old = None
+    try:
+        with open(SCHEDSTATS) as f:
+            sched_old = f.read().strip()
+        if sched_old != "1":
+            with open(SCHEDSTATS, "w") as f:
+                f.write("1\n")
+            print("[preflight] enabled kernel.sched_schedstats=1 (was %s)" % sched_old,
+                  file=sys.stderr)
+    except Exception as e:
+        print("[preflight] WARNING: could not set schedstats: %s" % e, file=sys.stderr)
+
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    shutil.copy2(src_bin, INSTALL_BIN)
+    os.chmod(INSTALL_BIN, 0o755)
+
+    subprocess.call(["pkill", "-f", "[s]chedstat_snap"], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+    time.sleep(0.2)
+    for path in (RAW_PATH, PID_PATH, STDERR_PATH):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ext = "jsonl" if args.format == "json" else "txt"
+    out_path = os.path.join(args.outdir, "bpfsnap_%s.%s" % (ts, ext))
+    os.makedirs(args.outdir, exist_ok=True)
+    open(out_path, "w").close()
+
+    cmd = [
+        INSTALL_BIN, str(args.interval), RAW_PATH, PID_PATH,
+        SLICE_PATHS[0], SLICE_PATHS[1], SLICE_PATHS[2], SERVICE_PARENT,
+    ]
+    with open(STDERR_PATH, "w") as errf:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errf)
+
+    stopping = {"done": False}
+
+    def stop(signum=None, frame=None):
+        stopping["done"] = True
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    print("[bpfsnap] pid=%s interval=%ds format=%s out=%s" % (
+        proc.pid, args.interval, args.format, out_path), file=sys.stderr)
+    print("[bpfsnap] stop with Ctrl-C", file=sys.stderr)
+
+    emitted = 0
+    try:
+        while not stopping["done"]:
+            if proc.poll() is not None:
+                print("[bpfsnap] collector exited early; see %s" % STDERR_PATH,
+                      file=sys.stderr)
+                break
+            try:
+                with open(RAW_PATH, "r") as f:
+                    content = f.read()
+            except IOError:
+                content = ""
+            ticks = parse_ticks(content)
+            while emitted < len(ticks):
+                enriched = enrich(ticks[emitted], num_cpus)
+                text = format_json(enriched) if args.format == "json" else format_raw(enriched)
+                with open(out_path, "a") as out:
+                    out.write(text)
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                emitted += 1
+            time.sleep(0.5)
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        subprocess.call(["pkill", "-f", "[s]chedstat_snap"], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+        if sched_old is not None and sched_old != "1":
+            try:
+                with open(SCHEDSTATS, "w") as f:
+                    f.write(sched_old + "\n")
+                print("[bpfsnap] restored schedstats to %s" % sched_old, file=sys.stderr)
+            except Exception:
+                pass
+        print("[bpfsnap] stopped; wrote %d ticks -> %s" % (emitted, out_path),
+              file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
