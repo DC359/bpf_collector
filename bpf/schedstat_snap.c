@@ -183,20 +183,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Attach exit (classify+cache) and free (final credit). Free is required:
-    // exit no longer accounts, so a silent free attach failure would drop all
-    // ephemeral / dying-thread CPU.
+    // Attach the exit tracepoint.
     struct bpf_link *exit_link = bpf_program__attach(skel->progs.snap_exit);
     if (!exit_link) {
         fprintf(stderr, "failed to attach snap_exit\n");
-        schedstat_snap_bpf__destroy(skel);
-        return 1;
-    }
-
-    struct bpf_link *free_link = bpf_program__attach(skel->progs.snap_free);
-    if (!free_link) {
-        fprintf(stderr, "failed to attach snap_free (sched_process_free required)\n");
-        bpf_link__destroy(exit_link);
         schedstat_snap_bpf__destroy(skel);
         return 1;
     }
@@ -205,7 +195,6 @@ int main(int argc, char **argv)
     struct bpf_link *iter_link = bpf_program__attach_iter(skel->progs.snap_iter, NULL);
     if (!iter_link) {
         fprintf(stderr, "failed to attach snap_iter\n");
-        bpf_link__destroy(free_link);
         bpf_link__destroy(exit_link);
         schedstat_snap_bpf__destroy(skel);
         return 1;
@@ -375,7 +364,6 @@ int main(int argc, char **argv)
     free(zero);
     free(svctbl);
     bpf_link__destroy(iter_link);
-    bpf_link__destroy(free_link);
     bpf_link__destroy(exit_link);
     schedstat_snap_bpf__destroy(skel);
     return 0;

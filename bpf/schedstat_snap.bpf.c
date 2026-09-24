@@ -6,10 +6,8 @@
 // Threads are accounted either during/by:
 //   1) the periodic sweep (iter/task) reads every LIVE thread, adds (now - last) to
 //      its slice's scoreboard, and refreshes last.
-//   2) sched_process_exit classifies the dying thread (cgroup still valid) and
-//      stashes {baseline, bucket, svc_id} in map `dying`, then drops `last`.
-//   3) sched_process_free reads the FINAL odometer (after teardown), credits the
-//      delta using the CACHED bucket — never re-classifies (cgroup is gone).
+//   2) the exit hook (tp_btf/sched_process_exit) catches DYING threads, adds
+//      (final - last), and deletes them from the baseline book.
 // Together these account for long-running, newborn, dying and ephemeral threads
 // without ever streaming per-thread data to userspace — only the small
 // per-slice / per-service scoreboards (agg_slice, agg_svc) cross the boundary.
@@ -51,16 +49,6 @@ struct accum {
     __u64 count;  // number of thread-contributions this round
 };
 
-// Stashed at sched_process_exit; consumed at sched_process_free.
-// Keyed by task_struct* so tid reuse during the RCU window cannot collide.
-struct dying_rec {
-    __u64 base_run;
-    __u64 base_wait;
-    __u64 svc_id;
-    __u32 bucket;
-    __u32 _pad;
-};
-
 // Baseline book: tid -> last odometer reading we counted.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -86,14 +74,6 @@ struct {
     __type(key, __u64);
     __type(value, struct accum);
 } agg_svc SEC(".maps");
-
-// Exit -> free handoff: identity frozen while cgroup is still valid.
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536);
-    __type(key, __u64);
-    __type(value, struct dying_rec);
-} dying SEC(".maps");
 
 static __always_inline void add_slice(__u32 bucket, __u64 run, __u64 wait)
 {
@@ -162,8 +142,8 @@ static __always_inline void classify(struct task_struct *task,
     }
 }
 
-// Core accounting for one LIVE task during the periodic sweep.
-static __always_inline void account(struct task_struct *task)
+// Core accounting for one task. is_exit selects refresh-vs-delete of baseline.
+static __always_inline void account(struct task_struct *task, int is_exit)
 {
     __u32 tid = BPF_CORE_READ(task, pid);  // kernel 'pid' == userspace TID
     if (tid == 0)
@@ -191,8 +171,12 @@ static __always_inline void account(struct task_struct *task)
     if (bucket == BUCKET_SERVICES && svc_id != 0)
         add_svc(svc_id, drun, dwait);
 
-    struct vals nv = { .run = run, .wait = wait };
-    bpf_map_update_elem(&last, &tid, &nv, BPF_ANY);
+    if (is_exit) {
+        bpf_map_delete_elem(&last, &tid);
+    } else {
+        struct vals nv = { .run = run, .wait = wait };
+        bpf_map_update_elem(&last, &tid, &nv, BPF_ANY);
+    }
 }
 
 // Userspace-triggered periodic sweep over all currently live tasks
@@ -202,70 +186,15 @@ int snap_iter(struct bpf_iter__task *ctx)
     struct task_struct *task = ctx->task;
     if (!task)
         return 0;
-    account(task);
+    account(task, 0);
     return 0;
 }
 
-// Classify while cgroup ancestry is still valid; defer final credit to free.
-// On 6.18, sched_process_exit runs before exit_mm / cgroup_exit.
+// Account a thread's final delta when it exits, then remove its baseline.
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(snap_exit, struct task_struct *p)
 {
-    if (!p)
-        return 0;
-
-    __u32 tid = BPF_CORE_READ(p, pid);
-    if (tid == 0)
-        return 0;
-
-    __u32 bucket;
-    __u64 svc_id;
-    classify(p, &bucket, &svc_id);
-
-    struct dying_rec d = {};
-    d.bucket = bucket;
-    d.svc_id = svc_id;
-
-    struct vals *prev = bpf_map_lookup_elem(&last, &tid);
-    if (prev) {
-        d.base_run = prev->run;
-        d.base_wait = prev->wait;
-        bpf_map_delete_elem(&last, &tid);
-    } else {
-        // Never swept: credit full lifetime at free (base 0).
-        d.base_run = 0;
-        d.base_wait = 0;
-    }
-
-    __u64 key = (__u64)p;
-    bpf_map_update_elem(&dying, &key, &d, BPF_ANY);
-    return 0;
-}
-
-// Final odometer is available here; attribute using the cached bucket only.
-SEC("tp_btf/sched_process_free")
-int BPF_PROG(snap_free, struct task_struct *p)
-{
-    if (!p)
-        return 0;
-
-    __u64 key = (__u64)p;
-    struct dying_rec *d = bpf_map_lookup_elem(&dying, &key);
-    if (!d)
-        return 0;
-
-    __u64 run  = BPF_CORE_READ(p, se.sum_exec_runtime);
-    __u64 wait = BPF_CORE_READ(p, sched_info.run_delay);
-
-    __u64 drun  = (run >= d->base_run) ? (run - d->base_run) : run;
-    __u64 dwait = (wait >= d->base_wait) ? (wait - d->base_wait) : wait;
-    __u32 bucket = d->bucket;
-    __u64 svc_id = d->svc_id;
-
-    bpf_map_delete_elem(&dying, &key);
-
-    add_slice(bucket, drun, dwait);
-    if (bucket == BUCKET_SERVICES && svc_id != 0)
-        add_svc(svc_id, drun, dwait);
+    if (p)
+        account(p, 1);
     return 0;
 }
