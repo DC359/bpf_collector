@@ -26,6 +26,13 @@ RAW_PATH = "/tmp/bpfsnap_raw.txt"
 PID_PATH = "/tmp/bpfsnap.pid"
 STDERR_PATH = "/tmp/bpfsnap_stderr.txt"
 
+# Only these slices are emitted (kernel still accounts "other"; we drop it).
+SLICE_OUT = {
+    "ahv-cvm.slice": "cvm",
+    "ahv-uvms.slice": "uvm",
+    "ahv.services": "services",
+}
+
 
 def build_metrics(X, Y, N, num_cpus, interval):
     INTERVAL_NS = interval * 1000000000
@@ -93,7 +100,7 @@ def parse_ticks(content):
     return ticks
 
 
-def enrich(tick, num_cpus):
+def enrich(tick, num_cpus, scope):
     interval = tick["interval_s"]
     out = {
         "tick": tick["tick"],
@@ -102,12 +109,16 @@ def enrich(tick, num_cpus):
         "interval_s": interval,
         "mono_ns": tick.get("mono_ns", 0),
         "slices": {},
-        "services": {},
     }
     for name, (run, wait, count) in tick["slices"].items():
-        out["slices"][name] = build_metrics(run, wait, count, num_cpus, interval)
-    for name, (run, wait, count) in tick["services"].items():
-        out["services"][name] = build_metrics(run, wait, count, num_cpus, interval)
+        short = SLICE_OUT.get(name)
+        if not short:
+            continue  # drop "other" and anything unexpected
+        out["slices"][short] = build_metrics(run, wait, count, num_cpus, interval)
+    if scope == "all":
+        out["services"] = {}
+        for name, (run, wait, count) in tick["services"].items():
+            out["services"][name] = build_metrics(run, wait, count, num_cpus, interval)
     return out
 
 
@@ -122,7 +133,7 @@ def format_raw(tick):
             "SLICE %s X=%d Y=%d Z=%d Demand=%d Supply=%d x_cores=%.2f y_cores=%.2f tasks=%d"
             % (name, m["X"], m["Y"], m["Z"], m["Demand"], m["Supply"],
                m["x_cores"], m["y_cores"], m["tasks"]))
-    for name, m in tick["services"].items():
+    for name, m in tick.get("services", {}).items():
         lines.append(
             "SERVICE %s X=%d Y=%d Z=%d Demand=%d Supply=%d x_cores=%.2f y_cores=%.2f tasks=%d"
             % (name, m["X"], m["Y"], m["Z"], m["Demand"], m["Supply"],
@@ -152,6 +163,9 @@ def main():
     ap.add_argument("-i", "--interval", type=int, default=5)
     ap.add_argument("-f", "--format", choices=("raw", "json"), default="raw")
     ap.add_argument("-o", "--outdir", default="/tmp")
+    ap.add_argument(
+        "-s", "--scope", choices=("slices", "all"), default="all",
+        help="slices = cvm/uvm/services only; all = those slices + per-service lines")
     args = ap.parse_args()
 
     if os.geteuid() != 0:
@@ -221,8 +235,8 @@ def main():
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    print("[bpfsnap] pid=%s interval=%ds format=%s out=%s" % (
-        proc.pid, args.interval, args.format, out_path), file=sys.stderr)
+    print("[bpfsnap] pid=%s interval=%ds format=%s scope=%s out=%s" % (
+        proc.pid, args.interval, args.format, args.scope, out_path), file=sys.stderr)
     print("[bpfsnap] stop with Ctrl-C", file=sys.stderr)
 
     emitted = 0
@@ -239,7 +253,7 @@ def main():
                 content = ""
             ticks = parse_ticks(content)
             while emitted < len(ticks):
-                enriched = enrich(ticks[emitted], num_cpus)
+                enriched = enrich(ticks[emitted], num_cpus, args.scope)
                 text = format_json(enriched) if args.format == "json" else format_raw(enriched)
                 with open(out_path, "a") as out:
                     out.write(text)

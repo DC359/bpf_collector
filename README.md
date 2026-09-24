@@ -6,7 +6,7 @@ Collect AHV host CPU time per cgroup slice/service via eBPF. No VM or workload o
 
 1. Loads a BPF program on the AHV host (task iterator + exit/free hooks).
 2. Every `--interval` seconds, sweeps live threads and accounts run/wait into
-   `ahv-cvm` / `ahv-uvms` / `ahv.services` / `other` (and per-service under `system.slice`).
+   **cvm** / **uvm** / **services** (and optionally each service under `system.slice`).
 3. Computes X, Y, Z, Demand, Supply, and cores for that interval.
 4. Appends one record to a timestamped file under `--outdir` (default `/tmp`).
 5. Runs until Ctrl-C / SIGTERM.
@@ -14,12 +14,14 @@ Collect AHV host CPU time per cgroup slice/service via eBPF. No VM or workload o
 ## Run (AHV host, as root)
 
 ```bash
-./scripts/bpfsnap_collect --interval 5 --format raw
-./scripts/bpfsnap_collect --interval 5 --format json
+./scripts/bpfsnap_collect --interval 5 --format raw --scope slices
+./scripts/bpfsnap_collect --interval 5 --format json --scope all
 ```
 
 - `--format raw` — text blocks
 - `--format json` — one JSON object per line (`.jsonl`)
+- `--scope slices` — cvm, uvm, services only
+- `--scope all` — those slices plus per-service lines (default)
 
 Stop: Ctrl-C. Output: `/tmp/bpfsnap_<timestamp>.txt` or `.jsonl`.
 
