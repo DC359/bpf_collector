@@ -1,6 +1,6 @@
 # Build the BPF snapshot+exit collector ON THE TARGET HOST.
 #
-# Requires (checked by the Python preflight before invoking make):
+# Requires:
 #   - clang/llvm     (compile the BPF object, -target bpf)
 #   - bpftool        (generate vmlinux.h from local BTF + the skeleton header)
 #   - libbpf-devel   (headers + libbpf.so for the userspace loader)
