@@ -27,7 +27,7 @@
 
 #include "cgroup_cpu_snap.skel.h"
 
-#define BPF_COLLECTOR_VERSION "0.2.0"
+#define BPF_COLLECTOR_VERSION "0.1.0"
 
 #define CVM_CG         "/sys/fs/cgroup/ahv.slice/ahv-cvm.slice"
 #define UVMS_CG        "/sys/fs/cgroup/ahv.slice/ahv-uvms.slice"
@@ -101,8 +101,7 @@ static void usage(const char *prog)
             "usage: %s [options]\n"
             "  -i, --interval SEC   sample interval (default 5)\n"
             "  -f, --format FMT     raw | json (default raw)\n"
-            "  -s, --scope SCOPE    slices | all (default all;\n"
-            "                      all = per-service + per-UVM UUID)\n"
+            "  -s, --scope SCOPE    slices | all (default all)\n"
             "  -o, --outdir DIR     log directory (default %s)\n"
             "  -h, --help           show this help\n",
             prog, DEFAULT_OUTDIR);

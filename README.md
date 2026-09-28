@@ -1,7 +1,6 @@
 # bpf_collector
 
-Collect AHV host CPU time per cgroup slice/service/UVM via eBPF. No VM or
-workload orchestration.
+Collect AHV host CPU time per cgroup via eBPF. No VM or workload orchestration.
 
 ## What you need on the host
 
@@ -32,16 +31,16 @@ then from CVM:
 
 ```bash
 /root/cgroup_cpu_snap --interval 5 --format raw --scope slices
-/root/cgroup_cpu_snap --interval 5 --format json --scope all
+/root/cgroup_cpu_snap --interval 5 --format raw --scope all
 ```
 
 
-| Option              | Values           | Notes                                                                     |
-| ------------------- | ---------------- | ------------------------------------------------------------------------- |
-| `--interval` / `-i` | seconds          | default `5`                                                               |
-| `--format` / `-f`   | `raw` \| `json`  | default `raw`                                                             |
-| `--scope` / `-s`    | `slices` \| `all`| `slices` = cvm/uvm/services totals; `all` also emits per-service **and** per-UVM UUID (default `all`) |
-| `--outdir` / `-o`   | directory        | default `/var/log/cpu-stats`                                              |
+| Option              | Values           | Notes                                      |
+| ------------------- | ---------------- | ------------------------------------------ |
+| `--interval` / `-i` | seconds          | default `5`                                |
+| `--format` / `-f`   | `raw` \| `json`  | default `raw`                              |
+| `--scope` / `-s`    | `slices` \| `all`| `slices` = cvm, uvm, services totals; `all` = also each service and each UVM (default `all`) |
+| `--outdir` / `-o`   | directory        | default `/var/log/cpu-stats`               |
 
 
 Stop with Ctrl-C. The tool enables `kernel.sched_schedstats=1` while running and
@@ -52,29 +51,13 @@ Output: `/var/log/cpu-stats/cgroup_cpu_snap_<timestamp>.txt` (or `.jsonl` for js
 ## How it works
 
 1. Loads a BPF program on the AHV host
-2. Every `--interval` seconds, accounts run/wait into **cvm** / **uvm** /
-  **services** (and, with `--scope all`, each service under `system.slice`
-  plus each UVM under `ahv-uvms.slice` named by guest UUID)
+2. Every `--interval` seconds, accounts run/wait for **cvm**, **uvm**, and
+  **services**. With `--scope all`, also lists each service and each UVM.
 3. Computes X, Y, Z, Demand, Supply, and cores for that interval
-4. Appends one record to a timestamped file under `--outdir` (and mirrors
-  raw/json ticks to stdout)
+4. Writes one tick to the log file and to stdout
 5. Runs until Ctrl-C / SIGTERM
 
-Log files start with version metadata (`0.2.0`).
-
-With `--scope all --format raw`, each tick looks like:
-
-```text
-TICK ...
-SLICE cvm ...
-SLICE uvm ...
-SLICE services ...
-SERVICE sshd.service ...
-UVM 2a516746-7653-4622-5d54-3423c5b9398c ...
-END_TICK
-```
-
-JSON mode adds `"uvms": { "<uuid>": { ... }, ... }` alongside `"services"`.
+Log files start with version metadata (`0.1.0`).
 
 ## Build (optional — only to refresh the prebuilt)
 
