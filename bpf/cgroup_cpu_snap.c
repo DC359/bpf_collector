@@ -27,7 +27,7 @@
 
 #include "cgroup_cpu_snap.skel.h"
 
-#define BPF_COLLECTOR_VERSION "0.1.0"
+#define BPF_COLLECTOR_VERSION "0.2.0"
 
 #define CVM_CG         "/sys/fs/cgroup/ahv.slice/ahv-cvm.slice"
 #define UVMS_CG        "/sys/fs/cgroup/ahv.slice/ahv-uvms.slice"
@@ -36,7 +36,7 @@
 #define SCHEDSTATS     "/proc/sys/kernel/sched_schedstats"
 #define DEFAULT_OUTDIR "/var/log/cpu-stats"
 
-/* One tick with --scope all can carry hundreds of service entries. */
+/* One tick with --scope all can carry hundreds of service + UVM entries. */
 #define JSON_BUF_SZ    (1 << 20)
 
 struct cg_handle {
@@ -101,7 +101,8 @@ static void usage(const char *prog)
             "usage: %s [options]\n"
             "  -i, --interval SEC   sample interval (default 5)\n"
             "  -f, --format FMT     raw | json (default raw)\n"
-            "  -s, --scope SCOPE    slices | all (default all)\n"
+            "  -s, --scope SCOPE    slices | all (default all;\n"
+            "                      all = per-service + per-UVM UUID)\n"
             "  -o, --outdir DIR     log directory (default %s)\n"
             "  -h, --help           show this help\n",
             prog, DEFAULT_OUTDIR);
@@ -122,12 +123,12 @@ static __u64 cgid_from_path(const char *path)
     return id;
 }
 
-struct svc_name {
+struct name_entry {
     __u64 id;
     char name[128];
 };
 
-static int scan_services(const char *parent, struct svc_name *out, int max)
+static int scan_services(const char *parent, struct name_entry *out, int max)
 {
     DIR *d = opendir(parent);
     struct dirent *e;
@@ -155,8 +156,140 @@ static int scan_services(const char *parent, struct svc_name *out, int max)
     return n;
 }
 
-static const char *name_for_id(struct svc_name *tbl, int n, __u64 id,
-                               char *buf, size_t buflen)
+/* Decode systemd-style \xHH escapes (e.g. \x2d -> '-') into dst. */
+static void unescape_cgroup_name(const char *src, char *dst, size_t dstlen)
+{
+    size_t i, j = 0;
+
+    for (i = 0; src[i] != '\0' && j + 1 < dstlen; ) {
+        if (src[i] == '\\' && src[i + 1] == 'x' && src[i + 2] && src[i + 3]) {
+            unsigned int v = 0;
+
+            if (sscanf(src + i + 2, "%2x", &v) == 1) {
+                dst[j++] = (char)v;
+                i += 4;
+                continue;
+            }
+        }
+        dst[j++] = src[i++];
+    }
+    dst[j] = '\0';
+}
+
+static int is_hex_digit(char c)
+{
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+/* Extract a canonical UUID from a machine-*.scope basename. */
+static int uuid_from_scope(const char *name, char *out, size_t outlen)
+{
+    char decoded[256];
+    size_t len;
+    const char *best = NULL;
+    const char *p;
+    int i;
+
+    unescape_cgroup_name(name, decoded, sizeof(decoded));
+    len = strlen(decoded);
+    if (len > 6 && strcmp(decoded + len - 6, ".scope") == 0)
+        decoded[len - 6] = '\0';
+
+    for (p = decoded; *p; p++) {
+        static const int groups[] = {8, 4, 4, 4, 12};
+        const char *q;
+        int g, ok = 1;
+
+        if (!is_hex_digit(p[0]))
+            continue;
+        if (strlen(p) < 36)
+            break;
+        q = p;
+        for (g = 0; g < 5 && ok; g++) {
+            int k;
+
+            if (g > 0) {
+                if (*q != '-') {
+                    ok = 0;
+                    break;
+                }
+                q++;
+            }
+            for (k = 0; k < groups[g]; k++) {
+                if (!is_hex_digit(*q)) {
+                    ok = 0;
+                    break;
+                }
+                q++;
+            }
+        }
+        if (ok && (*q == '\0' || *q == '.' || *q == '-'))
+            best = p;
+    }
+    if (!best || outlen < 37)
+        return 0;
+    memcpy(out, best, 36);
+    out[36] = '\0';
+    for (i = 0; i < 36; i++) {
+        if (out[i] >= 'A' && out[i] <= 'F')
+            out[i] = (char)(out[i] - 'A' + 'a');
+    }
+    return 1;
+}
+
+/* Discover machine-*.scope under ahv-uvms.slice (one level deeper) -> UUID. */
+static int scan_uvms(const char *uvms_parent, struct name_entry *out, int max)
+{
+    DIR *pd = opendir(uvms_parent);
+    struct dirent *pe;
+    int n = 0;
+    char partpath[512];
+    char scopepath[768];
+
+    if (!pd)
+        return 0;
+    while ((pe = readdir(pd)) != NULL && n < max) {
+        DIR *sd;
+        struct dirent *se;
+
+        if (pe->d_name[0] == '.')
+            continue;
+        if (pe->d_type != DT_DIR && pe->d_type != DT_UNKNOWN)
+            continue;
+        snprintf(partpath, sizeof(partpath), "%s/%s", uvms_parent, pe->d_name);
+        sd = opendir(partpath);
+        if (!sd)
+            continue;
+        while ((se = readdir(sd)) != NULL && n < max) {
+            __u64 id;
+
+            if (se->d_name[0] == '.')
+                continue;
+            if (se->d_type != DT_DIR && se->d_type != DT_UNKNOWN)
+                continue;
+            if (strncmp(se->d_name, "machine-", 8) != 0 &&
+                strncmp(se->d_name, "machine\\x2d", 11) != 0)
+                continue;
+            snprintf(scopepath, sizeof(scopepath), "%s/%s", partpath, se->d_name);
+            id = cgid_from_path(scopepath);
+            if (id == 0)
+                continue;
+            out[n].id = id;
+            if (!uuid_from_scope(se->d_name, out[n].name, sizeof(out[n].name)))
+                snprintf(out[n].name, sizeof(out[n].name), "uvm-%llu",
+                         (unsigned long long)id);
+            n++;
+        }
+        closedir(sd);
+    }
+    closedir(pd);
+    return n;
+}
+
+static const char *name_for_id(struct name_entry *tbl, int n, __u64 id,
+                               char *buf, size_t buflen, const char *fallback_pfx)
 {
     int i;
 
@@ -164,7 +297,7 @@ static const char *name_for_id(struct svc_name *tbl, int n, __u64 id,
         if (tbl[i].id == id)
             return tbl[i].name;
     }
-    snprintf(buf, buflen, "svc-%llu", (unsigned long long)id);
+    snprintf(buf, buflen, "%s-%llu", fallback_pfx, (unsigned long long)id);
     return buf;
 }
 
@@ -317,20 +450,20 @@ static void enable_schedstats(void)
             sched_old);
 }
 
-static void clear_svc_map(int svc_fd)
+static void clear_hash_map(int map_fd)
 {
     __u64 key = 0, next;
     static __u64 keys[8192];
     int nk = 0, i;
-    int have = (bpf_map_get_next_key(svc_fd, NULL, &next) == 0);
+    int have = (bpf_map_get_next_key(map_fd, NULL, &next) == 0);
 
     while (have && nk < 8192) {
         keys[nk++] = next;
         key = next;
-        have = (bpf_map_get_next_key(svc_fd, &key, &next) == 0);
+        have = (bpf_map_get_next_key(map_fd, &key, &next) == 0);
     }
     for (i = 0; i < nk; i++)
-        bpf_map_delete_elem(svc_fd, &keys[i]);
+        bpf_map_delete_elem(map_fd, &keys[i]);
 }
 
 int main(int argc, char **argv)
@@ -350,9 +483,10 @@ int main(int argc, char **argv)
     __u64 cvm_id, uvms_id, sys_id;
     struct cgroup_cpu_snap_bpf *skel;
     struct bpf_link *exit_link, *iter_link;
-    int slice_fd, svc_fd;
+    int slice_fd, svc_fd, uvm_fd;
     struct accum *percpu, *zero;
-    struct svc_name *svctbl;
+    struct name_entry *svctbl;
+    struct name_entry *uvmtbl;
     char *jsonbuf = NULL;
     unsigned long tick = 0;
     struct timespec ts_mono;
@@ -504,17 +638,20 @@ int main(int argc, char **argv)
 
     slice_fd = bpf_map__fd(skel->maps.agg_slice);
     svc_fd   = bpf_map__fd(skel->maps.agg_svc);
+    uvm_fd   = bpf_map__fd(skel->maps.agg_uvm);
 
     percpu = calloc(ncpu, sizeof(struct accum));
     zero   = calloc(ncpu, sizeof(struct accum));
-    svctbl = calloc(8192, sizeof(struct svc_name));
+    svctbl = calloc(8192, sizeof(struct name_entry));
+    uvmtbl = calloc(4096, sizeof(struct name_entry));
     if (fmt == FMT_JSON)
         jsonbuf = malloc(JSON_BUF_SZ);
-    if (!percpu || !zero || !svctbl || (fmt == FMT_JSON && !jsonbuf)) {
+    if (!percpu || !zero || !svctbl || !uvmtbl || (fmt == FMT_JSON && !jsonbuf)) {
         fprintf(stderr, "alloc failed\n");
         free(percpu);
         free(zero);
         free(svctbl);
+        free(uvmtbl);
         free(jsonbuf);
         bpf_link__destroy(iter_link);
         bpf_link__destroy(exit_link);
@@ -538,7 +675,8 @@ int main(int argc, char **argv)
         for (k = 0; k < N_SLICE_BUCKETS; k++)
             bpf_map_update_elem(slice_fd, &k, zero, BPF_ANY);
     }
-    clear_svc_map(svc_fd);
+    clear_hash_map(svc_fd);
+    clear_hash_map(uvm_fd);
 
     while (!exiting) {
         int s;
@@ -548,7 +686,7 @@ int main(int argc, char **argv)
         unsigned long long mono_ns;
         struct accum slice_tot[N_SLICE_BUCKETS];
         struct metrics slice_m[N_SLICE_BUCKETS];
-        int nsvc;
+        int nsvc, nuvm;
         __u32 k;
 
         for (s = 0; s < interval_s && !exiting; s++)
@@ -580,6 +718,7 @@ int main(int argc, char **argv)
         }
 
         nsvc = scan_services(SVC_PARENT, svctbl, 8192);
+        nuvm = scan_uvms(UVMS_CG, uvmtbl, 4096);
 
         now2 = time(NULL);
         localtime_r(&now2, &tmv);
@@ -617,11 +756,34 @@ int main(int argc, char **argv)
                         }
                         build_metrics(t.run, t.wait, t.count, interval_s, &sm);
                         nm = name_for_id(svctbl, nsvc, next, namebuf,
-                                         sizeof(namebuf));
+                                         sizeof(namebuf), "svc");
                         write_entity_raw(logf, "SERVICE", nm, &sm);
                     }
                     key = next;
                     have_key = (bpf_map_get_next_key(svc_fd, &key, &next) == 0);
+                }
+
+                key = 0;
+                have_key = (bpf_map_get_next_key(uvm_fd, NULL, &next) == 0);
+                while (have_key) {
+                    if (bpf_map_lookup_elem(uvm_fd, &next, percpu) == 0) {
+                        struct accum t = {0, 0, 0};
+                        struct metrics sm;
+                        const char *nm;
+                        int c;
+
+                        for (c = 0; c < ncpu; c++) {
+                            t.run   += percpu[c].run;
+                            t.wait  += percpu[c].wait;
+                            t.count += percpu[c].count;
+                        }
+                        build_metrics(t.run, t.wait, t.count, interval_s, &sm);
+                        nm = name_for_id(uvmtbl, nuvm, next, namebuf,
+                                         sizeof(namebuf), "uvm");
+                        write_entity_raw(logf, "UVM", nm, &sm);
+                    }
+                    key = next;
+                    have_key = (bpf_map_get_next_key(uvm_fd, &key, &next) == 0);
                 }
             }
             emit_dup(logf, "END_TICK\n");
@@ -677,7 +839,7 @@ int main(int argc, char **argv)
                         }
                         build_metrics(t.run, t.wait, t.count, interval_s, &sm);
                         nm = name_for_id(svctbl, nsvc, next, namebuf,
-                                         sizeof(namebuf));
+                                         sizeof(namebuf), "svc");
                         json_escape(nm, esc, sizeof(esc));
                         write_entity_json_fields(fields, sizeof(fields), &sm);
                         n = snprintf(jsonbuf + pos, JSON_BUF_SZ - pos,
@@ -690,6 +852,46 @@ int main(int argc, char **argv)
                     }
                     key = next;
                     have_key = (bpf_map_get_next_key(svc_fd, &key, &next) == 0);
+                }
+                n = snprintf(jsonbuf + pos, JSON_BUF_SZ - pos, "}");
+                if (n < 0 || (size_t)n >= JSON_BUF_SZ - pos)
+                    goto json_trunc;
+                pos += (size_t)n;
+
+                first = 1;
+                n = snprintf(jsonbuf + pos, JSON_BUF_SZ - pos, ",\"uvms\":{");
+                if (n < 0 || (size_t)n >= JSON_BUF_SZ - pos)
+                    goto json_trunc;
+                pos += (size_t)n;
+
+                have_key = (bpf_map_get_next_key(uvm_fd, NULL, &next) == 0);
+                while (have_key) {
+                    if (bpf_map_lookup_elem(uvm_fd, &next, percpu) == 0) {
+                        struct accum t = {0, 0, 0};
+                        struct metrics sm;
+                        const char *nm;
+                        int c;
+
+                        for (c = 0; c < ncpu; c++) {
+                            t.run   += percpu[c].run;
+                            t.wait  += percpu[c].wait;
+                            t.count += percpu[c].count;
+                        }
+                        build_metrics(t.run, t.wait, t.count, interval_s, &sm);
+                        nm = name_for_id(uvmtbl, nuvm, next, namebuf,
+                                         sizeof(namebuf), "uvm");
+                        json_escape(nm, esc, sizeof(esc));
+                        write_entity_json_fields(fields, sizeof(fields), &sm);
+                        n = snprintf(jsonbuf + pos, JSON_BUF_SZ - pos,
+                                     "%s\"%s\":{%s}",
+                                     first ? "" : ",", esc, fields);
+                        if (n < 0 || (size_t)n >= JSON_BUF_SZ - pos)
+                            goto json_trunc;
+                        pos += (size_t)n;
+                        first = 0;
+                    }
+                    key = next;
+                    have_key = (bpf_map_get_next_key(uvm_fd, &key, &next) == 0);
                 }
                 n = snprintf(jsonbuf + pos, JSON_BUF_SZ - pos, "}");
                 if (n < 0 || (size_t)n >= JSON_BUF_SZ - pos)
@@ -712,13 +914,15 @@ json_trunc:
 wipe:
         for (k = 0; k < N_SLICE_BUCKETS; k++)
             bpf_map_update_elem(slice_fd, &k, zero, BPF_ANY);
-        clear_svc_map(svc_fd);
+        clear_hash_map(svc_fd);
+        clear_hash_map(uvm_fd);
     }
 
     fprintf(stderr, "[snap] exiting, wrote %lu ticks -> %s\n", tick, outpath);
     free(percpu);
     free(zero);
     free(svctbl);
+    free(uvmtbl);
     free(jsonbuf);
     bpf_link__destroy(iter_link);
     bpf_link__destroy(exit_link);
