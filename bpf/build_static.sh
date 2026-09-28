@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a portable, statically-libbpf-linked schedstat_snap on an el8 build box,
+# Build a portable, statically-libbpf-linked cgroup_cpu_snap on an el8 build box,
 # targeting the el9 AHV host. vmlinux.h must already be present in this dir
 # (captured from the target host's BTF).
 #
@@ -48,16 +48,16 @@ ARCH=$(uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
 
 # 4) Compile BPF object (CO-RE; relocates to the target kernel at load time).
 clang -g -O2 -target bpf -D__TARGET_ARCH_${ARCH} -I. -I"$INC" \
-      -c schedstat_snap.bpf.c -o schedstat_snap.bpf.o
+      -c cgroup_cpu_snap.bpf.c -o cgroup_cpu_snap.bpf.o
 
 # 5) Generate the skeleton with the MODERN bpftool (ABI matches the static libbpf).
-"$BPFTOOL" gen skeleton schedstat_snap.bpf.o > schedstat_snap.skel.h
+"$BPFTOOL" gen skeleton cgroup_cpu_snap.bpf.o > cgroup_cpu_snap.skel.h
 
 # 6) Link the loader against the STATIC modern libbpf; elf/z/glibc stay dynamic.
-cc -g -O2 -I. -I"$INC" schedstat_snap.c -o schedstat_snap \
+cc -g -O2 -I. -I"$INC" cgroup_cpu_snap.c -o cgroup_cpu_snap \
    "$LIBA" -lelf -lz
 
 echo "[build] done:"
-file schedstat_snap
+file cgroup_cpu_snap
 echo "[build] dynamic deps (must NOT list libbpf):"
-ldd schedstat_snap
+ldd cgroup_cpu_snap

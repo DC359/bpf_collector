@@ -1,59 +1,56 @@
 # bpf_collector
 
-Collect AHV host CPU time per cgroup slice/service via eBPF. No VM or workload orchestration. 
+Collect AHV host CPU time per cgroup slice/service via eBPF. No VM or workload orchestration.
 
 ## What you need on the host
 
-Just the file `schedstat_snap`. Put it under `/root/bpfsnap/` (AHV mounts
+Just the file `cgroup_cpu_snap`. Put it under `/root/` (AHV mounts
 `/tmp` as `noexec`, so do not run from `/tmp`).
 
-## Get the binary onto a new host 
+## Get the binary onto a new host
 
 ### Recommended: wget from uranus
 
-After the prebuilt is published to uranus:
-
 ```bash
 # On AHV host, as root
-mkdir -p /root/bpfsnap /var/log/cpu-stats
-wget -O /root/bpfsnap/schedstat_snap \
-  https://uranus.corp.nutanix.com/~dhruv.choudhary/schedstat_snap
-
-chmod +x /root/bpfsnap/schedstat_snap
+mkdir -p /var/log/cpu-stats
+wget -O /root/cgroup_cpu_snap \
+  https://uranus.corp.nutanix.com/~dhruv.choudhary/cgroup_cpu_snap
+chmod +x /root/cgroup_cpu_snap
 ```
 
 ### Alternatives if uranus is unreachable
 
-- `scp -O` laptop → CVM → AHV `/root/bpfsnap/schedstat_snap`
+- `scp -O` laptop → CVM → AHV `/root/cgroup_cpu_snap`
 - SSH pipe (no scp subsystem):  
-`ssh nutanix@<CVM> 'cat > /tmp/schedstat_snap' < bpf/prebuilt/schedstat_snap`  
+`ssh nutanix@<CVM> 'cat > /tmp/cgroup_cpu_snap' < bpf/prebuilt/cgroup_cpu_snap`  
 then from CVM:  
-`ssh root@<AHV> 'mkdir -p /root/bpfsnap && cat > /root/bpfsnap/schedstat_snap' < /tmp/schedstat_snap`
+`ssh root@<AHV> 'cat > /root/cgroup_cpu_snap' < /tmp/cgroup_cpu_snap && chmod +x /root/cgroup_cpu_snap`
 
 ## Run (AHV host, as root)
 
 ```bash
-/root/bpfsnap/schedstat_snap --interval 5 --format raw --scope slices
-/root/bpfsnap/schedstat_snap --interval 5 --format json --scope all
+/root/cgroup_cpu_snap --interval 5 --format raw --scope slices
+/root/cgroup_cpu_snap --interval 5 --format json --scope all
 ```
 
 
 | Option              | Values           | Notes                                                                     |
 | ------------------- | ---------------- | ------------------------------------------------------------------------- |
 | `--interval` / `-i` | seconds          | default `5`                                                               |
-| `--format` / `-f`   | `raw` | `json`   | default `raw`                                                             |
-| `--scope` / `-s`    | `slices` | `all` | `slices` = cvm/uvm/services; `all` also emits per-service (default `all`) |
+| `--format` / `-f`   | `raw` \| `json`  | default `raw`                                                             |
+| `--scope` / `-s`    | `slices` \| `all`| `slices` = cvm/uvm/services; `all` also emits per-service (default `all`) |
 | `--outdir` / `-o`   | directory        | default `/var/log/cpu-stats`                                              |
 
 
 Stop with Ctrl-C. The tool enables `kernel.sched_schedstats=1` while running and
 restores the previous value on exit.
 
-Output: `/var/log/cpu-stats/bpfsnap_<timestamp>.txt` (or `.jsonl` for json).
+Output: `/var/log/cpu-stats/cgroup_cpu_snap_<timestamp>.txt` (or `.jsonl` for json).
 
 ## How it works
 
-1. Loads a BPF program on the AHV host 
+1. Loads a BPF program on the AHV host
 2. Every `--interval` seconds, accounts run/wait into **cvm** / **uvm** /
   **services** (and optionally each service under `system.slice`)
 3. Computes X, Y, Z, Demand, Supply, and cores for that interval
@@ -68,8 +65,8 @@ AHV has no toolchain. On a Linux build box with the target host's `vmlinux.h`:
 
 ```bash
 cd bpf && bash build_static.sh
-cp schedstat_snap prebuilt/schedstat_snap
+cp cgroup_cpu_snap prebuilt/cgroup_cpu_snap
 ```
 
-Then re-upload to uranus (see above) and/or commit `bpf/prebuilt/schedstat_snap`.
+Then re-upload to uranus and/or commit `bpf/prebuilt/cgroup_cpu_snap`.
 See [bpf/prebuilt/README.md](bpf/prebuilt/README.md) for build details.

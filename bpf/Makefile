@@ -6,7 +6,7 @@
 #   - libbpf-devel   (headers + libbpf.so for the userspace loader)
 #   - /sys/kernel/btf/vmlinux present (CO-RE)
 #
-# Output: ./schedstat_snap  (the userspace driver with the BPF object embedded)
+# Output: ./cgroup_cpu_snap  (the userspace driver with the BPF object embedded)
 
 CLANG    ?= clang
 BPFTOOL  ?= bpftool
@@ -14,11 +14,11 @@ CC       ?= cc
 
 ARCH     := $(shell uname -m | sed 's/x86_64/x86/; s/aarch64/arm64/')
 VMLINUX  := vmlinux.h
-BPF_SRC  := schedstat_snap.bpf.c
-BPF_OBJ  := schedstat_snap.bpf.o
-SKEL     := schedstat_snap.skel.h
-USER_SRC := schedstat_snap.c
-TARGET   := schedstat_snap
+BPF_SRC  := cgroup_cpu_snap.bpf.c
+BPF_OBJ  := cgroup_cpu_snap.bpf.o
+SKEL     := cgroup_cpu_snap.skel.h
+USER_SRC := cgroup_cpu_snap.c
+TARGET   := cgroup_cpu_snap
 
 # libbpf headers usually live under /usr/include (libbpf-devel). Allow override.
 LIBBPF_CFLAGS ?= -I/usr/include

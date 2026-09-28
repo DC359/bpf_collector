@@ -1,6 +1,6 @@
-bpf/schedstat_snap
-bpf/schedstat_snap.bpf.o
-bpf/schedstat_snap.skel.h
+bpf/cgroup_cpu_snap
+bpf/cgroup_cpu_snap.bpf.o
+bpf/cgroup_cpu_snap.skel.h
 bpf/.bpftool-src/
 bpf/.libbpf-install/
 *.o

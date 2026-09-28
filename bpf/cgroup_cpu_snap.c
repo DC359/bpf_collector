@@ -25,7 +25,7 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-#include "schedstat_snap.skel.h"
+#include "cgroup_cpu_snap.skel.h"
 
 #define BPF_COLLECTOR_VERSION "0.1.0"
 
@@ -348,7 +348,7 @@ int main(int argc, char **argv)
     struct tm tmv0;
     int ncpu;
     __u64 cvm_id, uvms_id, sys_id;
-    struct schedstat_snap_bpf *skel;
+    struct cgroup_cpu_snap_bpf *skel;
     struct bpf_link *exit_link, *iter_link;
     int slice_fd, svc_fd;
     struct accum *percpu, *zero;
@@ -420,7 +420,7 @@ int main(int argc, char **argv)
     now0 = time(NULL);
     localtime_r(&now0, &tmv0);
     strftime(ts_file, sizeof(ts_file), "%Y%m%d_%H%M%S", &tmv0);
-    snprintf(outpath, sizeof(outpath), "%s/bpfsnap_%s.%s",
+    snprintf(outpath, sizeof(outpath), "%s/cgroup_cpu_snap_%s.%s",
              outdir, ts_file, fmt == FMT_JSON ? "jsonl" : "txt");
 
     logf = fopen(outpath, "w");
@@ -460,7 +460,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "[snap] WARNING: system.slice id resolved to 0 — "
                         "service accounting will be empty\n");
 
-    skel = schedstat_snap_bpf__open();
+    skel = cgroup_cpu_snap_bpf__open();
     if (!skel) {
         fprintf(stderr, "failed to open skeleton\n");
         fclose(logf);
@@ -472,9 +472,9 @@ int main(int argc, char **argv)
     skel->rodata->uvms_id = uvms_id;
     skel->rodata->sys_id  = sys_id;
 
-    if (schedstat_snap_bpf__load(skel)) {
+    if (cgroup_cpu_snap_bpf__load(skel)) {
         fprintf(stderr, "failed to load BPF skeleton\n");
-        schedstat_snap_bpf__destroy(skel);
+        cgroup_cpu_snap_bpf__destroy(skel);
         fclose(logf);
         restore_schedstats();
         return 1;
@@ -483,7 +483,7 @@ int main(int argc, char **argv)
     exit_link = bpf_program__attach(skel->progs.snap_exit);
     if (!exit_link) {
         fprintf(stderr, "failed to attach snap_exit\n");
-        schedstat_snap_bpf__destroy(skel);
+        cgroup_cpu_snap_bpf__destroy(skel);
         fclose(logf);
         restore_schedstats();
         return 1;
@@ -493,7 +493,7 @@ int main(int argc, char **argv)
     if (!iter_link) {
         fprintf(stderr, "failed to attach snap_iter\n");
         bpf_link__destroy(exit_link);
-        schedstat_snap_bpf__destroy(skel);
+        cgroup_cpu_snap_bpf__destroy(skel);
         fclose(logf);
         restore_schedstats();
         return 1;
@@ -518,7 +518,7 @@ int main(int argc, char **argv)
         free(jsonbuf);
         bpf_link__destroy(iter_link);
         bpf_link__destroy(exit_link);
-        schedstat_snap_bpf__destroy(skel);
+        cgroup_cpu_snap_bpf__destroy(skel);
         fclose(logf);
         restore_schedstats();
         return 1;
@@ -722,7 +722,7 @@ wipe:
     free(jsonbuf);
     bpf_link__destroy(iter_link);
     bpf_link__destroy(exit_link);
-    schedstat_snap_bpf__destroy(skel);
+    cgroup_cpu_snap_bpf__destroy(skel);
     fclose(logf);
     restore_schedstats();
     return 0;

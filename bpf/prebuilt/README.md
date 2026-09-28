@@ -1,6 +1,6 @@
-# Prebuilt `schedstat_snap`
+# Prebuilt `cgroup_cpu_snap`
 
-`schedstat_snap` here is a precompiled, **statically-libbpf-linked** build of the
+`cgroup_cpu_snap` here is a precompiled, **statically-libbpf-linked** build of the
 BPF snapshot+exit collector. Copy it to the AHV host and run it directly —
 no `clang` / `bpftool` / `libbpf-devel` is needed on the host.
 
@@ -11,8 +11,8 @@ commit (or copy) the result.
 
 ## How it was built
 
-Built on a CentOS Stream 8 VM (`clang 17`), targeting the el9 AHV host
-(kernel `6.18.x el9`). `libbpf` is linked **statically** because el8 ships
+Built on a CentOS Stream 8 VM (`clang`), targeting the el9 AHV host
+(kernel `6.x el9`). `libbpf` is linked **statically** because el8 ships
 `libbpf.so.0` while the el9 host has `libbpf.so.1` — a dynamic link would not load
 on the host. `libelf` / `libz` / `glibc` stay dynamic (compatible across el8 -> el9).
 
@@ -35,14 +35,14 @@ Steps (see `../build_static.sh`):
 2. On the build box:
    ```bash
    cd bpf && bash build_static.sh
-   ldd schedstat_snap            # must NOT list libbpf.so.*
-   strip --strip-unneeded schedstat_snap
-   cp schedstat_snap prebuilt/schedstat_snap
+   ldd cgroup_cpu_snap            # must NOT list libbpf.so.*
+   strip --strip-unneeded cgroup_cpu_snap
+   cp cgroup_cpu_snap prebuilt/cgroup_cpu_snap
    ```
 
 ## Runtime notes
 
 - The AHV host mounts `/tmp`, `/var/tmp`, `/home` as `noexec`; run the binary
-  from `/root/bpfsnap`.
+  from `/root/cgroup_cpu_snap`.
 - The host still needs kernel features the collector checks at startup
   (BTF, `bpf_iter` task support, `sched_process_exit`).

@@ -1,4 +1,4 @@
-// schedstat_snap.bpf.c — in-kernel half of the BPF snapshot+exit collector.
+// cgroup_cpu_snap.bpf.c — in-kernel half of the BPF snapshot+exit collector.
 //
 // Idea: Each thread has cumulative run and scheduler-wait counters for its lifetime
 // (run = se.sum_exec_runtime, wait = sched_info.run_delay). We keep, per thread,
