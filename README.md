@@ -1,72 +1,80 @@
 # bpf_collector
 
-Collect AHV host CPU time per cgroup via eBPF. No VM or workload orchestration.
+Collect AHV host CPU time per cgroup via eBPF.
 
-## What you need on the host
-
-Just the file `cgroup_cpu_snap`. Put it under `/root/` (AHV mounts
-`/tmp` as `noexec`, so do not run from `/tmp`).
-
-## Get the binary onto a new host
-
-### Recommended: wget from uranus
+## New host setup (AHV, as root)
 
 ```bash
-# On AHV host, as root
 mkdir -p /var/log/cpu-stats
 wget -O /root/cgroup_cpu_snap \
   https://uranus.corp.nutanix.com/~dhruv.choudhary/cgroup_cpu_snap
 chmod +x /root/cgroup_cpu_snap
 ```
 
-### Alternatives if uranus is unreachable
+Must live under `/root/` — AHV mounts `/tmp` as `noexec`.
 
-- `scp -O` laptop → CVM → AHV `/root/cgroup_cpu_snap`
-- SSH pipe (no scp subsystem):  
-`ssh nutanix@<CVM> 'cat > /tmp/cgroup_cpu_snap' < bpf/prebuilt/cgroup_cpu_snap`  
-then from CVM:  
-`ssh root@<AHV> 'cat > /root/cgroup_cpu_snap' < /tmp/cgroup_cpu_snap && chmod +x /root/cgroup_cpu_snap`
+## Run
 
-## Run (AHV host, as root)
+Totals only (cvm / uvm / services):
 
 ```bash
 /root/cgroup_cpu_snap --interval 5 --format raw --scope slices
+```
+
+Totals plus each service and each UVM:
+
+```bash
 /root/cgroup_cpu_snap --interval 5 --format raw --scope all
 ```
 
+Stop with Ctrl-C.
 
-| Option              | Values           | Notes                                      |
-| ------------------- | ---------------- | ------------------------------------------ |
-| `--interval` / `-i` | seconds          | default `5`                                |
-| `--format` / `-f`   | `raw` \| `json`  | default `raw`                              |
-| `--scope` / `-s`    | `slices` \| `all`| `slices` = cvm, uvm, services totals; `all` = also each service and each UVM (default `all`) |
-| `--outdir` / `-o`   | directory        | default `/var/log/cpu-stats`               |
+Output goes to the terminal and to  
+`/var/log/cpu-stats/cgroup_cpu_snap_<timestamp>.txt`.
 
+## Options
 
-Stop with Ctrl-C. The tool enables `kernel.sched_schedstats=1` while running and
-restores the previous value on exit.
+| Option              | Values            | Default              |
+| ------------------- | ----------------- | -------------------- |
+| `--interval` / `-i` | seconds           | `5`                  |
+| `--format` / `-f`   | `raw` \| `json`   | `raw`                |
+| `--scope` / `-s`    | `slices` \| `all` | `all`                |
+| `--outdir` / `-o`   | directory         | `/var/log/cpu-stats` |
 
-Output: `/var/log/cpu-stats/cgroup_cpu_snap_<timestamp>.txt` (or `.jsonl` for json).
+- `slices` — cvm, uvm, services totals  
+- `all` — same totals, plus each service and each UVM  
 
-## How it works
+Version in the log header: `0.1.0`.
 
-1. Loads a BPF program on the AHV host
-2. Every `--interval` seconds, accounts run/wait for **cvm**, **uvm**, and
-  **services**. With `--scope all`, also lists each service and each UVM.
-3. Computes X, Y, Z, Demand, Supply, and cores for that interval
-4. Writes one tick to the log file and to stdout
-5. Runs until Ctrl-C / SIGTERM
+## If wget/uranus is unavailable
 
-Log files start with version metadata (`0.1.0`).
+Copy the prebuilt from this repo to the host:
 
-## Build (optional — only to refresh the prebuilt)
+```bash
+# Mac -> CVM
+scp -O bpf/prebuilt/cgroup_cpu_snap nutanix@<CVM_IP>:/tmp/cgroup_cpu_snap
 
-AHV has no toolchain. On a Linux build box with the target host's `vmlinux.h`:
+# CVM -> AHV
+ssh nutanix@<CVM_IP>
+scp -O /tmp/cgroup_cpu_snap root@<AHV_IP>:/root/cgroup_cpu_snap
+ssh root@<AHV_IP> 'chmod +x /root/cgroup_cpu_snap'
+```
+
+## Rebuild (maintainers only)
+
+On a Linux build box with the target host’s `vmlinux.h`:
 
 ```bash
 cd bpf && bash build_static.sh
 cp cgroup_cpu_snap prebuilt/cgroup_cpu_snap
 ```
 
-Then re-upload to uranus and/or commit `bpf/prebuilt/cgroup_cpu_snap`.
+Publish:
+
+```bash
+sftp dhruv.choudhary@upload.uranus.corp.nutanix.com
+# put prebuilt/cgroup_cpu_snap cgroup_cpu_snap
+# bye
+```
+
 See [bpf/prebuilt/README.md](bpf/prebuilt/README.md) for build details.
