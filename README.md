@@ -1,16 +1,15 @@
 # bpf_collector
 
-Collect AHV host CPU time per cgroup slice/service via eBPF. No VM or workload
-orchestration. **One binary — no RPM, no Python, no GitHub pull on the host.**
+Collect AHV host CPU time per cgroup slice/service via eBPF. No VM or workload orchestration. 
 
 ## What you need on the host
 
 Just the file `schedstat_snap`. Put it under `/root/bpfsnap/` (AHV mounts
 `/tmp` as `noexec`, so do not run from `/tmp`).
 
-## Get the binary onto a new host (no git on CVM/AHV)
+## Get the binary onto a new host 
 
-### Recommended: wget / curl from uranus
+### Recommended: wget from uranus
 
 After the prebuilt is published to uranus:
 
@@ -19,36 +18,17 @@ After the prebuilt is published to uranus:
 mkdir -p /root/bpfsnap /var/log/cpu-stats
 wget -O /root/bpfsnap/schedstat_snap \
   https://uranus.corp.nutanix.com/~dhruv.choudhary/schedstat_snap
-# if https fails: use http://uranus.corp.nutanix.com/~dhruv.choudhary/schedstat_snap
+
 chmod +x /root/bpfsnap/schedstat_snap
-```
-
-If `wget` is missing:
-
-```bash
-curl -L -o /root/bpfsnap/schedstat_snap \
-  https://uranus.corp.nutanix.com/~dhruv.choudhary/schedstat_snap
-chmod +x /root/bpfsnap/schedstat_snap
-```
-
-### Publish / refresh the uranus copy (from your laptop)
-
-```bash
-sftp dhruv.choudhary@upload.uranus.corp.nutanix.com
-# at the sftp> prompt:
-put bpf/prebuilt/schedstat_snap schedstat_snap
-bye
 ```
 
 ### Alternatives if uranus is unreachable
 
-- `scp` / `scp -O` laptop → CVM → AHV `/root/bpfsnap/schedstat_snap`
+- `scp -O` laptop → CVM → AHV `/root/bpfsnap/schedstat_snap`
 - SSH pipe (no scp subsystem):  
-  `ssh nutanix@<CVM> 'cat > /tmp/schedstat_snap' < bpf/prebuilt/schedstat_snap`  
-  then from CVM:  
-  `ssh root@<AHV> 'mkdir -p /root/bpfsnap && cat > /root/bpfsnap/schedstat_snap' < /tmp/schedstat_snap`
-
-You do **not** need `git clone` / `git pull` on the CVM or AHV.
+`ssh nutanix@<CVM> 'cat > /tmp/schedstat_snap' < bpf/prebuilt/schedstat_snap`  
+then from CVM:  
+`ssh root@<AHV> 'mkdir -p /root/bpfsnap && cat > /root/bpfsnap/schedstat_snap' < /tmp/schedstat_snap`
 
 ## Run (AHV host, as root)
 
@@ -57,12 +37,14 @@ You do **not** need `git clone` / `git pull` on the CVM or AHV.
 /root/bpfsnap/schedstat_snap --interval 5 --format json --scope all
 ```
 
-| Option | Values | Notes |
-|--------|--------|--------|
-| `--interval` / `-i` | seconds | default `5` |
-| `--format` / `-f` | `raw` \| `json` | default `raw` |
-| `--scope` / `-s` | `slices` \| `all` | `slices` = cvm/uvm/services; `all` also emits per-service (default `all`) |
-| `--outdir` / `-o` | directory | default `/var/log/cpu-stats` |
+
+| Option              | Values           | Notes                                                                     |
+| ------------------- | ---------------- | ------------------------------------------------------------------------- |
+| `--interval` / `-i` | seconds          | default `5`                                                               |
+| `--format` / `-f`   | `raw` | `json`   | default `raw`                                                             |
+| `--scope` / `-s`    | `slices` | `all` | `slices` = cvm/uvm/services; `all` also emits per-service (default `all`) |
+| `--outdir` / `-o`   | directory        | default `/var/log/cpu-stats`                                              |
+
 
 Stop with Ctrl-C. The tool enables `kernel.sched_schedstats=1` while running and
 restores the previous value on exit.
@@ -71,12 +53,12 @@ Output: `/var/log/cpu-stats/bpfsnap_<timestamp>.txt` (or `.jsonl` for json).
 
 ## How it works
 
-1. Loads a BPF program on the AHV host (task iterator + exit hook).
+1. Loads a BPF program on the AHV host 
 2. Every `--interval` seconds, accounts run/wait into **cvm** / **uvm** /
-   **services** (and optionally each service under `system.slice`).
-3. Computes X, Y, Z, Demand, Supply, and cores for that interval.
-4. Appends one record to a timestamped file under `--outdir`.
-5. Runs until Ctrl-C / SIGTERM.
+  **services** (and optionally each service under `system.slice`)
+3. Computes X, Y, Z, Demand, Supply, and cores for that interval
+4. Appends one record to a timestamped file under `--outdir`
+5. Runs until Ctrl-C / SIGTERM
 
 Log files start with version metadata (`0.1.0`).
 
