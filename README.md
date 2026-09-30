@@ -46,6 +46,13 @@ Output goes to the terminal and to
 
 Version in the log header: `0.1.0`.
 
+## Metrics
+
+Per thread the BPF program measures run (X), wait (Y), and alive time (T), then
+`Z = T − X − Y` and per-thread Demand. Published `X/Y/Z/Demand/Supply`
+are sums over threads in that slice/service/UVM. `Supply = X`. `x_cores` /
+`y_cores` calculated using the wall-clock `--interval`.
+
 ## If wget/uranus is unavailable
 
 Copy the prebuilt from this repo to the host:

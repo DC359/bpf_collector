@@ -59,6 +59,9 @@ struct accum {
     __u64 run;
     __u64 wait;
     __u64 count;
+    __u64 t;       // summed thread-alive ns (T)
+    __u64 z;       // summed Z
+    __u64 demand;  // summed per-thread Demand
 };
 
 struct metrics {
@@ -318,25 +321,20 @@ static int trigger_sweep(struct bpf_link *iter_link)
     return err;
 }
 
-static void build_metrics(__u64 X, __u64 Y, __u64 N, int interval_s,
+/* Metrics already computed per-thread in BPF and summed into accum. */
+static void build_metrics(const struct accum *a, int interval_s,
                           struct metrics *m)
 {
     __u64 INTERVAL_NS = (__u64)interval_s * 1000000000ULL;
-    __u64 T_ns = (__u64)interval_s * N * 1000000000ULL;
 
-    m->X = X;
-    m->Y = Y;
-    m->tasks = N;
-    m->Z = (T_ns > (X + Y)) ? (T_ns - X - Y) : 0;
-    m->Supply = X;
-    if ((X + m->Z) > 0) {
-        __u64 ratio_scaled = (X * 1000000ULL) / (X + m->Z);
-        m->Demand = X + (Y / 1000000ULL) * ratio_scaled;
-    } else {
-        m->Demand = X;
-    }
-    m->x_cores = (INTERVAL_NS > 0) ? ((double)X / (double)INTERVAL_NS) : 0.0;
-    m->y_cores = (INTERVAL_NS > 0) ? ((double)Y / (double)INTERVAL_NS) : 0.0;
+    m->X = a->run;
+    m->Y = a->wait;
+    m->Z = a->z;
+    m->Demand = a->demand;
+    m->Supply = a->run;
+    m->tasks = a->count;
+    m->x_cores = (INTERVAL_NS > 0) ? ((double)a->run / (double)INTERVAL_NS) : 0.0;
+    m->y_cores = (INTERVAL_NS > 0) ? ((double)a->wait / (double)INTERVAL_NS) : 0.0;
 }
 
 static void json_escape(const char *in, char *out, size_t outlen)
@@ -489,6 +487,7 @@ int main(int argc, char **argv)
     char *jsonbuf = NULL;
     unsigned long tick = 0;
     struct timespec ts_mono;
+    unsigned long long prev_mono_ns = 0;
 
     static struct option long_opts[] = {
         {"interval", required_argument, 0, 'i'},
@@ -702,7 +701,11 @@ int main(int argc, char **argv)
         mono_ns = (unsigned long long)ts_mono.tv_sec * 1000000000ULL
                 + (unsigned long long)ts_mono.tv_nsec;
 
+        /* Start of this accounting window = previous sweep's mono time. */
+        skel->bss->tick_start_ns = prev_mono_ns;
+
         trigger_sweep(iter_link);
+        prev_mono_ns = mono_ns;
 
         memset(slice_tot, 0, sizeof(slice_tot));
         for (k = 0; k < N_SLICE_BUCKETS; k++) {
@@ -710,9 +713,12 @@ int main(int argc, char **argv)
             if (bpf_map_lookup_elem(slice_fd, &k, percpu) != 0)
                 continue;
             for (c = 0; c < ncpu; c++) {
-                slice_tot[k].run   += percpu[c].run;
-                slice_tot[k].wait  += percpu[c].wait;
-                slice_tot[k].count += percpu[c].count;
+                slice_tot[k].run    += percpu[c].run;
+                slice_tot[k].wait   += percpu[c].wait;
+                slice_tot[k].count  += percpu[c].count;
+                slice_tot[k].t      += percpu[c].t;
+                slice_tot[k].z      += percpu[c].z;
+                slice_tot[k].demand += percpu[c].demand;
             }
         }
 
@@ -725,8 +731,7 @@ int main(int argc, char **argv)
 
         memset(slice_m, 0, sizeof(slice_m));
         for (k = 1; k < N_SLICE_BUCKETS; k++)
-            build_metrics(slice_tot[k].run, slice_tot[k].wait,
-                          slice_tot[k].count, interval_s, &slice_m[k]);
+            build_metrics(&slice_tot[k], interval_s, &slice_m[k]);
 
         if (fmt == FMT_RAW) {
             char thdr[160];
@@ -743,17 +748,20 @@ int main(int argc, char **argv)
 
                 while (have_key) {
                     if (bpf_map_lookup_elem(svc_fd, &next, percpu) == 0) {
-                        struct accum t = {0, 0, 0};
+                        struct accum t = {0};
                         struct metrics sm;
                         const char *nm;
                         int c;
 
                         for (c = 0; c < ncpu; c++) {
-                            t.run   += percpu[c].run;
-                            t.wait  += percpu[c].wait;
-                            t.count += percpu[c].count;
+                            t.run    += percpu[c].run;
+                            t.wait   += percpu[c].wait;
+                            t.count  += percpu[c].count;
+                            t.t      += percpu[c].t;
+                            t.z      += percpu[c].z;
+                            t.demand += percpu[c].demand;
                         }
-                        build_metrics(t.run, t.wait, t.count, interval_s, &sm);
+                        build_metrics(&t, interval_s, &sm);
                         nm = name_for_id(svctbl, nsvc, next, namebuf,
                                          sizeof(namebuf), "svc");
                         write_entity_raw(logf, "SERVICE", nm, &sm);
@@ -766,17 +774,20 @@ int main(int argc, char **argv)
                 have_key = (bpf_map_get_next_key(uvm_fd, NULL, &next) == 0);
                 while (have_key) {
                     if (bpf_map_lookup_elem(uvm_fd, &next, percpu) == 0) {
-                        struct accum t = {0, 0, 0};
+                        struct accum t = {0};
                         struct metrics sm;
                         const char *nm;
                         int c;
 
                         for (c = 0; c < ncpu; c++) {
-                            t.run   += percpu[c].run;
-                            t.wait  += percpu[c].wait;
-                            t.count += percpu[c].count;
+                            t.run    += percpu[c].run;
+                            t.wait   += percpu[c].wait;
+                            t.count  += percpu[c].count;
+                            t.t      += percpu[c].t;
+                            t.z      += percpu[c].z;
+                            t.demand += percpu[c].demand;
                         }
-                        build_metrics(t.run, t.wait, t.count, interval_s, &sm);
+                        build_metrics(&t, interval_s, &sm);
                         nm = name_for_id(uvmtbl, nuvm, next, namebuf,
                                          sizeof(namebuf), "uvm");
                         write_entity_raw(logf, "UVM", nm, &sm);
@@ -826,17 +837,20 @@ int main(int argc, char **argv)
                 have_key = (bpf_map_get_next_key(svc_fd, NULL, &next) == 0);
                 while (have_key) {
                     if (bpf_map_lookup_elem(svc_fd, &next, percpu) == 0) {
-                        struct accum t = {0, 0, 0};
+                        struct accum t = {0};
                         struct metrics sm;
                         const char *nm;
                         int c;
 
                         for (c = 0; c < ncpu; c++) {
-                            t.run   += percpu[c].run;
-                            t.wait  += percpu[c].wait;
-                            t.count += percpu[c].count;
+                            t.run    += percpu[c].run;
+                            t.wait   += percpu[c].wait;
+                            t.count  += percpu[c].count;
+                            t.t      += percpu[c].t;
+                            t.z      += percpu[c].z;
+                            t.demand += percpu[c].demand;
                         }
-                        build_metrics(t.run, t.wait, t.count, interval_s, &sm);
+                        build_metrics(&t, interval_s, &sm);
                         nm = name_for_id(svctbl, nsvc, next, namebuf,
                                          sizeof(namebuf), "svc");
                         json_escape(nm, esc, sizeof(esc));
@@ -866,17 +880,20 @@ int main(int argc, char **argv)
                 have_key = (bpf_map_get_next_key(uvm_fd, NULL, &next) == 0);
                 while (have_key) {
                     if (bpf_map_lookup_elem(uvm_fd, &next, percpu) == 0) {
-                        struct accum t = {0, 0, 0};
+                        struct accum t = {0};
                         struct metrics sm;
                         const char *nm;
                         int c;
 
                         for (c = 0; c < ncpu; c++) {
-                            t.run   += percpu[c].run;
-                            t.wait  += percpu[c].wait;
-                            t.count += percpu[c].count;
+                            t.run    += percpu[c].run;
+                            t.wait   += percpu[c].wait;
+                            t.count  += percpu[c].count;
+                            t.t      += percpu[c].t;
+                            t.z      += percpu[c].z;
+                            t.demand += percpu[c].demand;
                         }
-                        build_metrics(t.run, t.wait, t.count, interval_s, &sm);
+                        build_metrics(&t, interval_s, &sm);
                         nm = name_for_id(uvmtbl, nuvm, next, namebuf,
                                          sizeof(namebuf), "uvm");
                         json_escape(nm, esc, sizeof(esc));

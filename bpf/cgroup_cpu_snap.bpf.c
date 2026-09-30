@@ -2,16 +2,18 @@
 //
 // Idea: Each thread has cumulative run and scheduler-wait counters for its lifetime
 // (run = se.sum_exec_runtime, wait = sched_info.run_delay). We keep, per thread,
-// the odometer value we last counted (the "baseline book", map `last`).
+// the odometer value we last counted (the "baseline book", map `last`), plus the
+// ktime at which we took that snapshot (`ts`) so we can measure thread-alive
+// time T_i for the interval.
+//
+// Per thread we compute X_i, Y_i, T_i, Z_i, Demand_i and add them into the
+// per-slice / per-service / per-UVM scoreboards. Userspace only reads those
+// aggregates — no per-thread stream.
+//
 // Threads are accounted either during/by:
-//   1) the periodic sweep (iter/task) reads every LIVE thread, adds (now - last) to
-//      its slice's scoreboard, and refreshes last.
+//   1) the periodic sweep (iter/task) reads every LIVE thread, adds deltas, refreshes last.
 //   2) the exit hook (tp_btf/sched_process_exit) catches DYING threads, adds
-//      (final - last), and deletes them from the baseline book.
-// Together these account for long-running, newborn, dying and ephemeral threads
-// without ever streaming per-thread data to userspace — only the small
-// per-slice / per-service / per-UVM scoreboards (agg_slice, agg_svc, agg_uvm)
-// cross the boundary.
+//      final deltas, and deletes them from the baseline book.
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -42,15 +44,24 @@ const volatile __u64 cvm_id  = 0;
 const volatile __u64 uvms_id = 0;
 const volatile __u64 sys_id  = 0;
 
+// Published by userspace each tick (= previous sweep's mono ns). Used only when
+// a thread has no usable baseline and is not a newborn this window, so T_i is
+// not charged as a full lifetime.
+volatile __u64 tick_start_ns = 0;
+
 struct vals {
     __u64 run;   // se.sum_exec_runtime snapshot
     __u64 wait;  // sched_info.run_delay snapshot
+    __u64 ts;    // bpf_ktime_get_ns() when the above were taken
 };
 
 struct accum {
-    __u64 run;    // summed run delta this round
-    __u64 wait;   // summed wait delta this round
-    __u64 count;  // number of thread-contributions this round
+    __u64 run;     // summed X_i
+    __u64 wait;    // summed Y_i
+    __u64 count;   // number of thread-contributions this round
+    __u64 t;       // summed T_i (thread-alive ns)
+    __u64 z;       // summed Z_i
+    __u64 demand;  // summed Demand_i
 };
 
 // Baseline book: tid -> last odometer reading we counted.
@@ -61,7 +72,7 @@ struct {
     __type(value, struct vals);
 } last SEC(".maps");
 
-// Per-slice scoreboard (4 fixed buckets). Per-CPU to avoid contention 
+// Per-slice scoreboard (4 fixed buckets). Per-CPU to avoid contention
 // between CPUs; userspace sums across CPUs.
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -88,38 +99,56 @@ struct {
     __type(value, struct accum);
 } agg_uvm SEC(".maps");
 
-static __always_inline void add_slice(__u32 bucket, __u64 run, __u64 wait)
+static __always_inline void add_slice(__u32 bucket, __u64 run, __u64 wait,
+                                      __u64 t, __u64 z, __u64 demand)
 {
     struct accum *a = bpf_map_lookup_elem(&agg_slice, &bucket);
     if (a) {
         a->run += run;
         a->wait += wait;
         a->count += 1;
+        a->t += t;
+        a->z += z;
+        a->demand += demand;
     }
 }
 
-static __always_inline void add_svc(__u64 id, __u64 run, __u64 wait)
+static __always_inline void add_svc(__u64 id, __u64 run, __u64 wait,
+                                    __u64 t, __u64 z, __u64 demand)
 {
     struct accum *a = bpf_map_lookup_elem(&agg_svc, &id);
     if (a) {
         a->run += run;
         a->wait += wait;
         a->count += 1;
+        a->t += t;
+        a->z += z;
+        a->demand += demand;
     } else {
-        struct accum n = { .run = run, .wait = wait, .count = 1 };
+        struct accum n = {
+            .run = run, .wait = wait, .count = 1,
+            .t = t, .z = z, .demand = demand,
+        };
         bpf_map_update_elem(&agg_svc, &id, &n, BPF_ANY);
     }
 }
 
-static __always_inline void add_uvm(__u64 id, __u64 run, __u64 wait)
+static __always_inline void add_uvm(__u64 id, __u64 run, __u64 wait,
+                                    __u64 t, __u64 z, __u64 demand)
 {
     struct accum *a = bpf_map_lookup_elem(&agg_uvm, &id);
     if (a) {
         a->run += run;
         a->wait += wait;
         a->count += 1;
+        a->t += t;
+        a->z += z;
+        a->demand += demand;
     } else {
-        struct accum n = { .run = run, .wait = wait, .count = 1 };
+        struct accum n = {
+            .run = run, .wait = wait, .count = 1,
+            .t = t, .z = z, .demand = demand,
+        };
         bpf_map_update_elem(&agg_uvm, &id, &n, BPF_ANY);
     }
 }
@@ -174,6 +203,14 @@ static __always_inline void classify(struct task_struct *task,
     }
 }
 
+// frac = a * b / denom without overflowing a u64 multiply.
+static __always_inline __u64 mul_div_u64(__u64 a, __u64 b, __u64 denom)
+{
+    if (denom == 0)
+        return 0;
+    return (a / denom) * b + ((a % denom) * b) / denom;
+}
+
 // Core accounting for one task. is_exit selects refresh-vs-delete of baseline.
 static __always_inline void account(struct task_struct *task, int is_exit)
 {
@@ -181,35 +218,56 @@ static __always_inline void account(struct task_struct *task, int is_exit)
     if (tid == 0)
         return;  // idle/swapper
 
+    __u64 now  = bpf_ktime_get_ns();
     __u64 run  = BPF_CORE_READ(task, se.sum_exec_runtime);
     __u64 wait = BPF_CORE_READ(task, sched_info.run_delay);
 
     struct vals *prev = bpf_map_lookup_elem(&last, &tid);
-    __u64 drun, dwait;
+    __u64 drun, dwait, dt;
+
     if (prev && run >= prev->run) {
         drun  = run - prev->run;
         dwait = (wait >= prev->wait) ? (wait - prev->wait) : wait;
+        dt    = (now >= prev->ts) ? (now - prev->ts) : 0;
     } else {
-        // No usable baseline: count the task's current lifetime totals
+        // No usable baseline: X/Y = lifetime totals (stock). T from birth or
+        // tick window — never dump full uptime into one interval.
         drun  = run;
         dwait = wait;
+        dt    = 0;
+
+        __u64 start = 0;
+        if (bpf_core_field_exists(task->start_time))
+            start = BPF_CORE_READ(task, start_time);
+
+        if (start != 0 && (tick_start_ns == 0 || start >= tick_start_ns) &&
+            now >= start) {
+            dt = now - start;                 // newborn this window
+        } else if (tick_start_ns != 0 && now >= tick_start_ns) {
+            dt = now - tick_start_ns;         // lost baseline, long-lived
+        }
     }
+
+    __u64 dz = (dt > drun + dwait) ? (dt - drun - dwait) : 0;
+    __u64 demand = drun;
+    if (drun + dz > 0)
+        demand = drun + mul_div_u64(dwait, drun, drun + dz);
 
     __u32 bucket;
     __u64 svc_id;
     __u64 uvm_id;
     classify(task, &bucket, &svc_id, &uvm_id);
 
-    add_slice(bucket, drun, dwait);
+    add_slice(bucket, drun, dwait, dt, dz, demand);
     if (bucket == BUCKET_SERVICES && svc_id != 0)
-        add_svc(svc_id, drun, dwait);
+        add_svc(svc_id, drun, dwait, dt, dz, demand);
     if (bucket == BUCKET_UVMS && uvm_id != 0)
-        add_uvm(uvm_id, drun, dwait);
+        add_uvm(uvm_id, drun, dwait, dt, dz, demand);
 
     if (is_exit) {
         bpf_map_delete_elem(&last, &tid);
     } else {
-        struct vals nv = { .run = run, .wait = wait };
+        struct vals nv = { .run = run, .wait = wait, .ts = now };
         bpf_map_update_elem(&last, &tid, &nv, BPF_ANY);
     }
 }
