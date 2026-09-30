@@ -34,17 +34,17 @@ Output goes to the terminal and to
 
 ## Options
 
-| Option              | Values            | Default              |
-| ------------------- | ----------------- | -------------------- |
-| `--interval` / `-i` | seconds           | `5`                  |
-| `--format` / `-f`   | `raw` \| `json`   | `raw`                |
-| `--scope` / `-s`    | `slices` \| `all` | `all`                |
-| `--outdir` / `-o`   | directory         | `/var/log/cpu-stats` |
+
+| Option              | Values           | Default              |
+| ------------------- | ---------------- | -------------------- |
+| `--interval` / `-i` | seconds          | `5`                  |
+| `--format` / `-f`   | `raw` | `json`   | `raw`                |
+| `--scope` / `-s`    | `slices` | `all` | `all`                |
+| `--outdir` / `-o`   | directory        | `/var/log/cpu-stats` |
+
 
 - `slices` — cvm, uvm, services totals  
-- `all` — same totals, plus each service and each UVM  
-
-Version in the log header: `0.1.0`.
+- `all` — same totals, plus each service and each UVM
 
 ## Metrics
 
@@ -67,6 +67,8 @@ scp -O /tmp/cgroup_cpu_snap root@<AHV_IP>:/root/cgroup_cpu_snap
 ssh root@<AHV_IP> 'chmod +x /root/cgroup_cpu_snap'
 ```
 
+
+
 ## Rebuild (maintainers only)
 
 On a Linux build box with the target host’s `vmlinux.h`:
@@ -76,12 +78,4 @@ cd bpf && bash build_static.sh
 cp cgroup_cpu_snap prebuilt/cgroup_cpu_snap
 ```
 
-Publish:
-
-```bash
-sftp dhruv.choudhary@upload.uranus.corp.nutanix.com
-# put prebuilt/cgroup_cpu_snap cgroup_cpu_snap
-# bye
-```
-
-See [bpf/prebuilt/README.md](bpf/prebuilt/README.md) for build details.
+Publish: See [bpf/prebuilt/README.md](bpf/prebuilt/README.md) for build details.
