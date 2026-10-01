@@ -48,10 +48,12 @@ Output goes to the terminal and to
 
 ## Metrics
 
-Per thread the BPF program measures run (X), wait (Y), and alive time (T), then
-`Z = T − X − Y` and per-thread Demand. Published `X/Y/Z/Demand/Supply`
-are sums over threads in that slice/service/UVM. `Supply = X`. `x_cores` /
-`y_cores` calculated using the wall-clock `--interval`.
+Per thread the BPF program measures run (`delta_execution`), wait (`delta_ready`),
+and alive time (T), then `delta_sleep = T − delta_execution − delta_ready` and
+per-thread Demand. Published values are sums over threads in that
+slice/service/UVM. `Supply = delta_execution`. `execution_cores` /
+`ready_cores` (and `execution_ready_cores` = sum) use the wall-clock `--interval`.
+`Demand` and `Supply` keep those names.
 
 ## If wget/uranus is unavailable
 
@@ -66,8 +68,6 @@ ssh nutanix@<CVM_IP>
 scp -O /tmp/cgroup_cpu_snap root@<AHV_IP>:/root/cgroup_cpu_snap
 ssh root@<AHV_IP> 'chmod +x /root/cgroup_cpu_snap'
 ```
-
-
 
 ## Rebuild (maintainers only)
 

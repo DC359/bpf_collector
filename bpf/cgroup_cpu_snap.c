@@ -60,13 +60,13 @@ struct accum {
     __u64 wait;
     __u64 count;
     __u64 t;       // summed thread-alive ns (T)
-    __u64 z;       // summed Z
+    __u64 z;       // summed delta_sleep
     __u64 demand;  // summed per-thread Demand
 };
 
 struct metrics {
-    __u64 X, Y, Z, Demand, Supply;
-    double x_cores, y_cores;
+    __u64 delta_execution, delta_ready, delta_sleep, Demand, Supply;
+    double execution_cores, ready_cores;
     __u64 tasks;
 };
 
@@ -327,14 +327,16 @@ static void build_metrics(const struct accum *a, int interval_s,
 {
     __u64 INTERVAL_NS = (__u64)interval_s * 1000000000ULL;
 
-    m->X = a->run;
-    m->Y = a->wait;
-    m->Z = a->z;
+    m->delta_execution = a->run;
+    m->delta_ready = a->wait;
+    m->delta_sleep = a->z;
     m->Demand = a->demand;
     m->Supply = a->run;
     m->tasks = a->count;
-    m->x_cores = (INTERVAL_NS > 0) ? ((double)a->run / (double)INTERVAL_NS) : 0.0;
-    m->y_cores = (INTERVAL_NS > 0) ? ((double)a->wait / (double)INTERVAL_NS) : 0.0;
+    m->execution_cores = (INTERVAL_NS > 0)
+        ? ((double)a->run / (double)INTERVAL_NS) : 0.0;
+    m->ready_cores = (INTERVAL_NS > 0)
+        ? ((double)a->wait / (double)INTERVAL_NS) : 0.0;
 }
 
 static void json_escape(const char *in, char *out, size_t outlen)
@@ -365,16 +367,22 @@ static void emit_dup(FILE *logf, const char *text)
 static void write_entity_raw(FILE *logf, const char *kind, const char *name,
                              const struct metrics *m)
 {
-    char buf[640];
+    char buf[768];
 
     snprintf(buf, sizeof(buf),
-             "%s %s X=%llu Y=%llu Z=%llu Demand=%llu Supply=%llu "
-             "x_cores=%.2f y_cores=%.2f tasks=%llu\n",
+             "%s %s delta_execution=%llu delta_ready=%llu delta_sleep=%llu "
+             "Demand=%llu Supply=%llu "
+             "execution_cores=%.2f ready_cores=%.2f "
+             "execution_ready_cores=%.2f tasks=%llu\n",
              kind, name,
-             (unsigned long long)m->X, (unsigned long long)m->Y,
-             (unsigned long long)m->Z, (unsigned long long)m->Demand,
+             (unsigned long long)m->delta_execution,
+             (unsigned long long)m->delta_ready,
+             (unsigned long long)m->delta_sleep,
+             (unsigned long long)m->Demand,
              (unsigned long long)m->Supply,
-             m->x_cores, m->y_cores, (unsigned long long)m->tasks);
+             m->execution_cores, m->ready_cores,
+             m->execution_cores + m->ready_cores,
+             (unsigned long long)m->tasks);
     emit_dup(logf, buf);
 }
 
@@ -382,12 +390,17 @@ static void write_entity_json_fields(char *buf, size_t buflen,
                                      const struct metrics *m)
 {
     snprintf(buf, buflen,
-             "\"X\":%llu,\"Y\":%llu,\"Z\":%llu,\"Demand\":%llu,\"Supply\":%llu,"
-             "\"x_cores\":%.2f,\"y_cores\":%.2f,\"xy_cores\":%.2f,\"tasks\":%llu",
-             (unsigned long long)m->X, (unsigned long long)m->Y,
-             (unsigned long long)m->Z, (unsigned long long)m->Demand,
+             "\"delta_execution\":%llu,\"delta_ready\":%llu,\"delta_sleep\":%llu,"
+             "\"Demand\":%llu,\"Supply\":%llu,"
+             "\"execution_cores\":%.2f,\"ready_cores\":%.2f,"
+             "\"execution_ready_cores\":%.2f,\"tasks\":%llu",
+             (unsigned long long)m->delta_execution,
+             (unsigned long long)m->delta_ready,
+             (unsigned long long)m->delta_sleep,
+             (unsigned long long)m->Demand,
              (unsigned long long)m->Supply,
-             m->x_cores, m->y_cores, m->x_cores + m->y_cores,
+             m->execution_cores, m->ready_cores,
+             m->execution_cores + m->ready_cores,
              (unsigned long long)m->tasks);
 }
 

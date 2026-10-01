@@ -230,8 +230,8 @@ static __always_inline void account(struct task_struct *task, int is_exit)
         dwait = (wait >= prev->wait) ? (wait - prev->wait) : wait;
         dt    = (now >= prev->ts) ? (now - prev->ts) : 0;
     } else {
-        // No usable baseline: X/Y = lifetime totals (stock). T from birth or
-        // tick window — never dump full uptime into one interval.
+        // No usable baseline: delta_execution/delta_ready = lifetime totals (stock).
+        // T from birth or tick window — never dump full uptime into one interval.
         drun  = run;
         dwait = wait;
         dt    = 0;
