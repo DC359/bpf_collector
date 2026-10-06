@@ -55,6 +55,10 @@ static const char *SLICE_OUT[N_SLICE_BUCKETS] = {
     NULL, "cvm", "uvm", "services",
 };
 
+static const char *SLICE_CG[N_SLICE_BUCKETS] = {
+    NULL, CVM_CG, UVMS_CG, SYS_CG,
+};
+
 struct accum {
     __u64 run;
     __u64 wait;
@@ -128,6 +132,7 @@ static __u64 cgid_from_path(const char *path)
 struct name_entry {
     __u64 id;
     char name[128];
+    char path[768];
 };
 
 static int scan_services(const char *parent, struct name_entry *out, int max)
@@ -152,6 +157,7 @@ static int scan_services(const char *parent, struct name_entry *out, int max)
             continue;
         out[n].id = id;
         snprintf(out[n].name, sizeof(out[n].name), "%s", e->d_name);
+        snprintf(out[n].path, sizeof(out[n].path), "%s", childpath);
         n++;
     }
     closedir(d);
@@ -282,6 +288,7 @@ static int scan_uvms(const char *uvms_parent, struct name_entry *out, int max)
             if (!uuid_from_scope(se->d_name, out[n].name, sizeof(out[n].name)))
                 snprintf(out[n].name, sizeof(out[n].name), "uvm-%llu",
                          (unsigned long long)id);
+            snprintf(out[n].path, sizeof(out[n].path), "%s", scopepath);
             n++;
         }
         closedir(sd);
@@ -301,6 +308,35 @@ static const char *name_for_id(struct name_entry *tbl, int n, __u64 id,
     }
     snprintf(buf, buflen, "%s-%llu", fallback_pfx, (unsigned long long)id);
     return buf;
+}
+
+static const char *path_for_id(struct name_entry *tbl, int n, __u64 id)
+{
+    int i;
+
+    for (i = 0; i < n; i++) {
+        if (tbl[i].id == id)
+            return tbl[i].path;
+    }
+    return NULL;
+}
+
+static unsigned long long read_memory_current(const char *cgdir)
+{
+    char path[896];
+    FILE *f;
+    unsigned long long v = 0;
+
+    if (!cgdir || !cgdir[0])
+        return 0;
+    snprintf(path, sizeof(path), "%s/memory.current", cgdir);
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    if (fscanf(f, "%llu", &v) != 1)
+        v = 0;
+    fclose(f);
+    return v;
 }
 
 static int trigger_sweep(struct bpf_link *iter_link)
@@ -365,15 +401,15 @@ static void emit_dup(FILE *logf, const char *text)
 }
 
 static void write_entity_raw(FILE *logf, const char *kind, const char *name,
-                             const struct metrics *m)
+                             const struct metrics *m, unsigned long long mem)
 {
-    char buf[768];
+    char buf[832];
 
     snprintf(buf, sizeof(buf),
              "%s %s delta_execution=%llu delta_ready=%llu delta_sleep=%llu "
              "Demand=%llu Supply=%llu "
              "execution_cores=%.2f ready_cores=%.2f "
-             "execution_ready_cores=%.2f tasks=%llu\n",
+             "execution_ready_cores=%.2f tasks=%llu memory_current=%llu\n",
              kind, name,
              (unsigned long long)m->delta_execution,
              (unsigned long long)m->delta_ready,
@@ -382,18 +418,20 @@ static void write_entity_raw(FILE *logf, const char *kind, const char *name,
              (unsigned long long)m->Supply,
              m->execution_cores, m->ready_cores,
              m->execution_cores + m->ready_cores,
-             (unsigned long long)m->tasks);
+             (unsigned long long)m->tasks, mem);
     emit_dup(logf, buf);
 }
 
 static void write_entity_json_fields(char *buf, size_t buflen,
-                                     const struct metrics *m)
+                                     const struct metrics *m,
+                                     unsigned long long mem)
 {
     snprintf(buf, buflen,
              "\"delta_execution\":%llu,\"delta_ready\":%llu,\"delta_sleep\":%llu,"
              "\"Demand\":%llu,\"Supply\":%llu,"
              "\"execution_cores\":%.2f,\"ready_cores\":%.2f,"
-             "\"execution_ready_cores\":%.2f,\"tasks\":%llu",
+             "\"execution_ready_cores\":%.2f,\"tasks\":%llu,"
+             "\"memory_current\":%llu",
              (unsigned long long)m->delta_execution,
              (unsigned long long)m->delta_ready,
              (unsigned long long)m->delta_sleep,
@@ -401,7 +439,7 @@ static void write_entity_json_fields(char *buf, size_t buflen,
              (unsigned long long)m->Supply,
              m->execution_cores, m->ready_cores,
              m->execution_cores + m->ready_cores,
-             (unsigned long long)m->tasks);
+             (unsigned long long)m->tasks, mem);
 }
 
 static int preflight(void)
@@ -752,7 +790,8 @@ int main(int argc, char **argv)
                      tick, ts_start, ts_end, interval_s, mono_ns);
             emit_dup(logf, thdr);
             for (k = 1; k < N_SLICE_BUCKETS; k++)
-                write_entity_raw(logf, "SLICE", SLICE_OUT[k], &slice_m[k]);
+                write_entity_raw(logf, "SLICE", SLICE_OUT[k], &slice_m[k],
+                                 read_memory_current(SLICE_CG[k]));
 
             if (scope == SCOPE_ALL) {
                 char namebuf[64];
@@ -777,7 +816,9 @@ int main(int argc, char **argv)
                         build_metrics(&t, interval_s, &sm);
                         nm = name_for_id(svctbl, nsvc, next, namebuf,
                                          sizeof(namebuf), "svc");
-                        write_entity_raw(logf, "SERVICE", nm, &sm);
+                        write_entity_raw(logf, "SERVICE", nm, &sm,
+                                         read_memory_current(
+                                             path_for_id(svctbl, nsvc, next)));
                     }
                     key = next;
                     have_key = (bpf_map_get_next_key(svc_fd, &key, &next) == 0);
@@ -803,7 +844,9 @@ int main(int argc, char **argv)
                         build_metrics(&t, interval_s, &sm);
                         nm = name_for_id(uvmtbl, nuvm, next, namebuf,
                                          sizeof(namebuf), "uvm");
-                        write_entity_raw(logf, "UVM", nm, &sm);
+                        write_entity_raw(logf, "UVM", nm, &sm,
+                                         read_memory_current(
+                                             path_for_id(uvmtbl, nuvm, next)));
                     }
                     key = next;
                     have_key = (bpf_map_get_next_key(uvm_fd, &key, &next) == 0);
@@ -823,8 +866,9 @@ int main(int argc, char **argv)
             pos += (size_t)n;
 
             for (k = 1; k < N_SLICE_BUCKETS; k++) {
-                char fields[256];
-                write_entity_json_fields(fields, sizeof(fields), &slice_m[k]);
+                char fields[384];
+                write_entity_json_fields(fields, sizeof(fields), &slice_m[k],
+                                         read_memory_current(SLICE_CG[k]));
                 n = snprintf(jsonbuf + pos, JSON_BUF_SZ - pos, "%s\"%s\":{%s}",
                              k > 1 ? "," : "", SLICE_OUT[k], fields);
                 if (n < 0 || (size_t)n >= JSON_BUF_SZ - pos)
@@ -837,7 +881,7 @@ int main(int argc, char **argv)
             pos += (size_t)n;
 
             if (scope == SCOPE_ALL) {
-                char namebuf[64], esc[160], fields[256];
+                char namebuf[64], esc[160], fields[384];
                 __u64 key = 0, next;
                 int first = 1;
                 int have_key;
@@ -867,7 +911,9 @@ int main(int argc, char **argv)
                         nm = name_for_id(svctbl, nsvc, next, namebuf,
                                          sizeof(namebuf), "svc");
                         json_escape(nm, esc, sizeof(esc));
-                        write_entity_json_fields(fields, sizeof(fields), &sm);
+                        write_entity_json_fields(fields, sizeof(fields), &sm,
+                                                 read_memory_current(
+                                                     path_for_id(svctbl, nsvc, next)));
                         n = snprintf(jsonbuf + pos, JSON_BUF_SZ - pos,
                                      "%s\"%s\":{%s}",
                                      first ? "" : ",", esc, fields);
@@ -910,7 +956,9 @@ int main(int argc, char **argv)
                         nm = name_for_id(uvmtbl, nuvm, next, namebuf,
                                          sizeof(namebuf), "uvm");
                         json_escape(nm, esc, sizeof(esc));
-                        write_entity_json_fields(fields, sizeof(fields), &sm);
+                        write_entity_json_fields(fields, sizeof(fields), &sm,
+                                                 read_memory_current(
+                                                     path_for_id(uvmtbl, nuvm, next)));
                         n = snprintf(jsonbuf + pos, JSON_BUF_SZ - pos,
                                      "%s\"%s\":{%s}",
                                      first ? "" : ",", esc, fields);

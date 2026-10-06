@@ -54,6 +54,7 @@ per-thread Demand. Published values are sums over threads in that
 slice/service/UVM. `Supply = delta_execution`. `execution_cores` /
 `ready_cores` (and `execution_ready_cores` = sum) use the wall-clock `--interval`.
 `Demand` and `Supply` keep those names.
+Each tick also reports `memory_current` (bytes) from that cgroup’s `memory.current`.
 
 ## If wget/uranus is unavailable
 
